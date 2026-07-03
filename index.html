@@ -729,11 +729,21 @@ async function loadDB() {
     try {
       const remote = await window._fbLoad();
       if (remote) {
-        DB.obras    = remote.obras    || DB.obras    || {};
-        DB.medicoes = remote.medicoes || DB.medicoes || {};
-        window.DB = DB;
-        // Atualiza local com dados da nuvem
-        localStorage.setItem('mediobra_v3', JSON.stringify(DB));
+        // Só aceita a nuvem se ela tiver MAIS ou IGUAL quantidade de obras
+        // que o local. Isso evita que uma nuvem vazia/desatualizada apague
+        // dados que só existiam localmente (ex: cadastrados offline em campo).
+        const localCount  = Object.keys(DB.obras || {}).length;
+        const remoteCount = Object.keys(remote.obras || {}).length;
+        if (remoteCount >= localCount) {
+          DB.obras    = remote.obras    || DB.obras    || {};
+          DB.medicoes = remote.medicoes || DB.medicoes || {};
+          window.DB = DB;
+          // Atualiza local com dados da nuvem
+          localStorage.setItem('mediobra_v3', JSON.stringify(DB));
+        } else {
+          console.warn('Nuvem tinha menos obras que o local — mantendo dados locais e reenviando para a nuvem.');
+          if (window._fbSave) window._fbSave(DB);
+        }
       }
     } catch(e) { console.warn('Firebase load falhou, usando local:', e); }
   }
@@ -826,7 +836,7 @@ function renderHome() {
         ruasToCount.forEach(r => {
           d.servicos.forEach((_,i) => {
             const s = lastMed.state[r]?.[d.id]?.[i]?.status || 'NI';
-            total++; const _pv=med.state[r]?.[d.id]?.[i]?.pct??0; if(_pv===100) ex++; else if(_pv>0) ep++; else ni++;
+            total++; const _pv=lastMed.state[r]?.[d.id]?.[i]?.pct??0; if(_pv===100) ex++; else if(_pv>0) ep++; else ni++;
           });
         });
       });
