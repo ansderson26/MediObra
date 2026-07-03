@@ -687,14 +687,71 @@ const DEFAULT_DISC = [
 // }
 
 let DB = { obras:{}, medicoes:{}, photos:{} };
+
+// ════════════════════════════════════════════════
+// INDEXEDDB — Armazenamento de fotos (muito mais espaço que localStorage)
+// ════════════════════════════════════════════════
+const IDB_NAME = 'mediobra_photos_db';
+const IDB_STORE = 'photos';
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(new Error('IndexedDB indisponível')); return; }
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(IDB_STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbGetAllPhotos() {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const result = {};
+      const req = store.openCursor();
+      req.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (cursor) { result[cursor.key] = cursor.value; cursor.continue(); }
+        else resolve(result);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch(e) { console.warn('IDB: falha ao carregar fotos', e); return {}; }
+}
+async function idbSetPhotoKey(key, arr) {
+  try {
+    const db = await idbOpen();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(arr, key);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch(e) {
+    console.warn('IDB: falha ao salvar foto', e);
+    showToast('Espaço de fotos cheio — baixe e apague fotos antigas','warn');
+  }
+}
+async function idbDeletePhotoKey(key) {
+  try {
+    const db = await idbOpen();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(key);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch(e) { console.warn('IDB: falha ao apagar foto', e); }
+}
 window.DB = DB;
 
 // ── Salva local + nuvem ──────────────────────────
 window._lastSaveTs = 0;
 function saveDB() {
-  // 1. Salva local (inclui fotos)
+  // 1. Salva local (obras + medições — fotos ficam no IndexedDB, à parte)
   try {
-    localStorage.setItem('mediobra_v3', JSON.stringify(DB));
+    localStorage.setItem('mediobra_v3', JSON.stringify({ obras: DB.obras, medicoes: DB.medicoes }));
   } catch(e) {
     showToast('Armazenamento local cheio — exporte o Excel!','warn');
   }
@@ -719,10 +776,15 @@ async function loadDB() {
       const d = JSON.parse(s);
       DB.obras    = d.obras    || {};
       DB.medicoes = d.medicoes || {};
-      DB.photos   = d.photos   || {};
       window.DB = DB;
     }
   } catch(e) {}
+
+  // Carrega fotos do IndexedDB (espaço bem maior que localStorage)
+  try {
+    DB.photos = await idbGetAllPhotos();
+    window.DB = DB;
+  } catch(e) { console.warn('Falha ao carregar fotos do IndexedDB:', e); }
 
   // Depois tenta nuvem (tem prioridade)
   if (window._fbLoad) {
@@ -864,8 +926,10 @@ async function deleteObra(id) {
   if (!ok) return;
   delete DB.obras[id];
   delete DB.medicoes[id];
-  // limpa fotos
-  Object.keys(DB.photos).filter(k=>k.startsWith(id+'__')).forEach(k=>delete DB.photos[k]);
+  // limpa fotos (memória + IndexedDB)
+  const photoKeysToDel = Object.keys(DB.photos).filter(k=>k.startsWith(id+'__'));
+  photoKeysToDel.forEach(k=>delete DB.photos[k]);
+  await Promise.all(photoKeysToDel.map(k=>idbDeletePhotoKey(k)));
   saveDB();
   renderHome();
 }
@@ -1683,7 +1747,9 @@ async function deleteMed(medId) {
   const ok = await confirm2('Excluir medição?', `"${med.nome}" será apagada permanentemente. Esta ação não pode ser desfeita.`);
   if (!ok) return;
   DB.medicoes[currentObraId] = (DB.medicoes[currentObraId]||[]).filter(m=>m.id!==medId);
-  Object.keys(DB.photos).filter(k=>k.includes(medId)).forEach(k=>delete DB.photos[k]);
+  const medPhotoKeysToDel = Object.keys(DB.photos).filter(k=>k.includes(medId));
+  medPhotoKeysToDel.forEach(k=>delete DB.photos[k]);
+  await Promise.all(medPhotoKeysToDel.map(k=>idbDeletePhotoKey(k)));
   if (currentMedId === medId) {
     const meds = DB.medicoes[currentObraId];
     currentMedId = meds.length ? meds[meds.length-1].id : null;
@@ -1762,11 +1828,14 @@ async function movePhoto(idx) {
   const newKey = newParts.join('__');
 
   // Move the photo
-  const photoData = DB.photos[currentPhotoKey][idx];
-  DB.photos[currentPhotoKey].splice(idx, 1);
-  if (!DB.photos[currentPhotoKey].length) delete DB.photos[currentPhotoKey];
+  const oldKey = currentPhotoKey;
+  const photoData = DB.photos[oldKey][idx];
+  DB.photos[oldKey].splice(idx, 1);
+  if (!DB.photos[oldKey].length) { delete DB.photos[oldKey]; await idbDeletePhotoKey(oldKey); }
+  else { await idbSetPhotoKey(oldKey, DB.photos[oldKey]); }
   if (!DB.photos[newKey]) DB.photos[newKey] = [];
   DB.photos[newKey].push(photoData);
+  await idbSetPhotoKey(newKey, DB.photos[newKey]);
 
   saveDB();
   renderPhotoGrid();
@@ -1774,85 +1843,187 @@ async function movePhoto(idx) {
   showToast('✓ Foto movida para ' + (novaRua === '_global' ? 'Global' : 'Rua ' + novaRua));
 }
 
-function dlPhoto(idx) {
-  const list = DB.photos[currentPhotoKey] || [];
-  if (!list[idx]) return;
-  const src = list[idx];
-  // Parse photoKey for filename: obraId__medId__rua__discId__servIdx
-  const parts = currentPhotoKey.split('__');
-  const rua = parts[2] === '_global' ? 'Global' : parts[2];
-  const disc = parts[3] || 'foto';
-  const fname = rua.replace(/\s+/g,'_') + '__' + disc + '__' + String(idx+1).padStart(2,'0') + '.jpg';
-  
-  // Convert base64 to blob and download
-  fetch(src).then(r => r.blob()).then(blob => {
+// ── Salvar fotos no dispositivo (galeria) ──────────
+// No iPhone/Android usa o compartilhamento nativo (1 toque em "Guardar Imagem",
+// não precisa de internet). No PC, baixa direto como arquivo.
+function isMobileShareCapable() {
+  return /iPad|iPhone|iPod|Android/.test(navigator.userAgent);
+}
+
+async function saveBlobsToDevice(blobsWithNames) {
+  if (isMobileShareCapable() && navigator.canShare) {
+    try {
+      const files = blobsWithNames.map(({blob, filename}) => new File([blob], filename, { type: blob.type || 'image/jpeg' }));
+      if (navigator.canShare({ files })) {
+        await navigator.share({ files });
+        return 'shared';
+      }
+      console.warn('canShare recusou o lote de '+files.length+' arquivo(s) — usando download individual.');
+    } catch(e) {
+      if (e.name === 'AbortError') return 'cancelled';
+      console.warn('Compartilhamento falhou, tentando download direto:', e);
+    }
+  }
+  // Fallback: download clássico (PC / navegadores sem suporte a compartilhar arquivos)
+  // IMPORTANTE: precisa de um intervalo entre cada clique — o navegador bloqueia
+  // múltiplos downloads disparados no mesmo instante (trata como popup/spam).
+  for (const {blob, filename} of blobsWithNames) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = fname;
+    a.href = url; a.download = filename;
     document.body.appendChild(a); a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    showToast('✓ ' + fname);
-  });
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return 'downloaded';
 }
+
+function photoFileName(key, idx) {
+  const parts = key.split('__');
+  const rua = (parts[2] === '_global' ? 'Global' : parts[2]) || 'foto';
+  const disc = parts[3] || 'foto';
+  return rua.replace(/\s+/g,'_') + '__' + disc + '__' + String(idx+1).padStart(2,'0') + '.jpg';
+}
+
+async function dlPhoto(idx) {
+  const list = DB.photos[currentPhotoKey] || [];
+  if (!list[idx]) return;
+  const fname = photoFileName(currentPhotoKey, idx);
+  const blob = await (await fetch(list[idx])).blob();
+  const result = await saveBlobsToDevice([{ blob, filename: fname }]);
+  if (result !== 'cancelled') showToast('✓ ' + fname);
+}
+
+const SHARE_BATCH_SIZE = 15; // limite prático por chamada de compartilhamento
 
 async function dlAllPhotos() {
   const list = DB.photos[currentPhotoKey] || [];
   if (!list.length) { showToast('Nenhuma foto'); return; }
-  showToast('Baixando ' + list.length + ' fotos...');
+  showToast('Preparando ' + list.length + ' fotos...');
+  const items = [];
   for (let i = 0; i < list.length; i++) {
-    dlPhoto(i);
-    // Small delay between downloads so browser doesn't block them
-    await new Promise(r => setTimeout(r, 600));
+    const blob = await (await fetch(list[i])).blob();
+    items.push({ blob, filename: photoFileName(currentPhotoKey, i) });
+  }
+  for (let i = 0; i < items.length; i += SHARE_BATCH_SIZE) {
+    const batch = items.slice(i, i + SHARE_BATCH_SIZE);
+    const result = await saveBlobsToDevice(batch);
+    if (result === 'cancelled') { showToast('Envio cancelado'); return; }
   }
   showToast('✓ ' + list.length + ' fotos salvas');
 }
 
-function dlAllMedPhotos() {
+async function dlAllMedPhotos() {
   const med = getMed(); if (!med) return;
   const prefix = currentObraId + '__' + med.id;
   const keys = Object.keys(DB.photos).filter(k => k.startsWith(prefix));
   let total = 0;
   keys.forEach(k => total += (DB.photos[k]||[]).length);
   if (!total) { showToast('Nenhuma foto nesta medição'); return; }
-  showToast('Baixando ' + total + ' fotos da medição...');
-  let delay = 0;
-  keys.forEach(k => {
-    const parts = k.split('__');
-    const rua = parts[2] === '_global' ? 'Global' : parts[2];
-    const disc = parts[3] || 'foto';
-    (DB.photos[k]||[]).forEach((src, idx) => {
-      setTimeout(() => {
-        const fname = rua.replace(/\s+/g,'_') + '__' + disc + '__' + String(idx+1).padStart(2,'0') + '.jpg';
-        fetch(src).then(r => r.blob()).then(blob => {
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url; a.download = fname;
-          document.body.appendChild(a); a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
-        });
-      }, delay);
-      delay += 600;
-    });
-  });
-  setTimeout(() => showToast('✓ ' + total + ' fotos salvas'), delay + 500);
+  showToast('Preparando ' + total + ' fotos...');
+  const items = [];
+  for (const k of keys) {
+    const arr = DB.photos[k] || [];
+    for (let idx = 0; idx < arr.length; idx++) {
+      const blob = await (await fetch(arr[idx])).blob();
+      items.push({ blob, filename: photoFileName(k, idx) });
+    }
+  }
+  for (let i = 0; i < items.length; i += SHARE_BATCH_SIZE) {
+    const batch = items.slice(i, i + SHARE_BATCH_SIZE);
+    const result = await saveBlobsToDevice(batch);
+    if (result === 'cancelled') { showToast('Envio cancelado'); return; }
+  }
+  showToast('✓ ' + total + ' fotos salvas');
 }
 
-function delPhoto(idx) {
-  DB.photos[currentPhotoKey].splice(idx,1);
-  if(!DB.photos[currentPhotoKey].length) delete DB.photos[currentPhotoKey];
+async function delPhoto(idx) {
+  const key = currentPhotoKey;
+  DB.photos[key].splice(idx,1);
+  if(!DB.photos[key].length){ delete DB.photos[key]; await idbDeletePhotoKey(key); }
+  else { await idbSetPhotoKey(key, DB.photos[key]); }
   saveDB(); renderPhotoGrid(); renderMedContent();
 }
+// ── Geolocalização (para carimbo GPS na foto) ──────
+function getGeoPosition() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) { reject(new Error('Geolocalização indisponível')); return; }
+    navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 8000, enableHighAccuracy: true, maximumAge: 60000 });
+  });
+}
+
+// ── Carimba a foto com legenda (obra, data, rua, GPS) ──
+async function stampPhoto(dataUrl, ruaLabel) {
+  let pos = null;
+  try { pos = await getGeoPosition(); } catch(e) { /* segue sem GPS */ }
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const W = img.width, H = img.height;
+      const canvas = document.createElement('canvas');
+      canvas.width = W; canvas.height = H;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+
+      const obra = DB.obras[currentObraId] || {};
+      const now = new Date();
+      const dataStr = now.toLocaleDateString('pt-BR') + ' ' + now.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+      const linha1 = (obra.nome||'') + (obra.local ? ' — ' + obra.local : '') + ' | ' + dataStr;
+      const linha2 = ruaLabel;
+      const gpsTxt = pos
+        ? 'GPS: ' + pos.coords.latitude.toFixed(5) + ', ' + pos.coords.longitude.toFixed(5) + '  ±' + Math.round(pos.coords.accuracy) + 'm'
+        : 'GPS: indisponível';
+      const linha3 = 'Pine Engenharia   ' + gpsTxt;
+
+      // Tamanhos proporcionais à foto (fonte um pouco reduzida)
+      const f1 = Math.round(H*0.0185), f2 = Math.round(H*0.0140), f3 = Math.round(H*0.0112);
+      const gap = Math.round(H*0.008);
+      const padTop = Math.round(H*0.014), padBot = Math.round(H*0.016), padX = Math.round(W*0.018);
+      const bandH = padTop + f1 + gap + f2 + gap + f3 + padBot;
+      const bandY = H - bandH;
+
+      ctx.fillStyle = 'rgb(26,61,36)';
+      ctx.fillRect(0, bandY, W, bandH);
+
+      ctx.textBaseline = 'top';
+      ctx.textAlign = 'left';
+      let y = bandY + padTop;
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `bold ${f1}px -apple-system,"Segoe UI",Helvetica,Arial,sans-serif`;
+      ctx.fillText(linha1, padX, y);
+      y += f1 + gap;
+
+      ctx.font = `${f2}px -apple-system,"Segoe UI",Helvetica,Arial,sans-serif`;
+      ctx.fillText(linha2, padX, y);
+      y += f2 + gap;
+
+      ctx.fillStyle = 'rgba(255,255,255,0.78)';
+      ctx.font = `${f3}px -apple-system,"Segoe UI",Helvetica,Arial,sans-serif`;
+      ctx.fillText(linha3, padX, y);
+
+      resolve(canvas.toDataURL('image/jpeg', 0.9));
+    };
+    img.src = dataUrl;
+  });
+}
+
 document.getElementById('file-input').addEventListener('change', e => {
   const files=[...e.target.files];
   if(!files.length||!currentPhotoKey) return;
   if(!DB.photos[currentPhotoKey]) DB.photos[currentPhotoKey]=[];
+  const key = currentPhotoKey;
+  const parts = key.split('__');
+  const ruaLabel = parts[2] === '_global' ? 'Global' : ('Rua ' + parts[2]);
   let loaded=0;
   files.forEach(f=>{
     const r=new FileReader();
-    r.onload=ev=>{ DB.photos[currentPhotoKey].push(ev.target.result); loaded++;
-      if(loaded===files.length){saveDB();renderPhotoGrid();renderMedContent();} };
+    r.onload=async ev=>{
+      const stamped = await stampPhoto(ev.target.result, ruaLabel);
+      DB.photos[key].push(stamped); loaded++;
+      if(loaded===files.length){ await idbSetPhotoKey(key, DB.photos[key]); saveDB(); renderPhotoGrid(); renderMedContent(); } };
     r.readAsDataURL(f);
   });
   e.target.value='';
