@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Limpar Fotos — MediObra</title>
+<style>
+:root{--pine:#1e5c32;--bg:#0f1a12;--surface:#1a2e1f;--border:#2a4a32;--text:#e8f0ea;--text2:#9ab8a2;--red:#c0392b}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100dvh}
+.hdr{background:var(--pine);padding:16px 20px;text-align:center}
+.hdr h1{font-size:18px;font-weight:700}
+.hdr p{font-size:11px;opacity:.75;margin-top:2px}
+.wrap{padding:16px;max-width:520px;margin:0 auto}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:14px}
+.card h2{font-size:14px;margin-bottom:8px}
+.stat{font-size:32px;font-weight:800;color:#fff;margin:6px 0}
+.stat-label{font-size:12px;color:var(--text2)}
+.hint{font-size:12px;color:var(--text2);line-height:1.5;margin-top:8px}
+.btn{width:100%;padding:14px;border:none;border-radius:10px;font-size:15px;font-weight:700;font-family:inherit;cursor:pointer;margin-bottom:10px}
+.btn:active{transform:scale(.97)}
+.btn-danger{background:linear-gradient(135deg,var(--red),#8e2a1f);color:#fff}
+.btn-danger:disabled{opacity:.4}
+.btn-back{background:var(--surface);color:var(--text);border:1px solid var(--border)}
+.status{text-align:center;padding:14px;font-size:13px;color:var(--text2)}
+.ok{color:#7ed394;font-weight:700}
+.list{max-height:260px;overflow-y:auto;font-family:ui-monospace,monospace;font-size:11px;color:var(--text2);background:rgba(0,0,0,.2);border-radius:8px;padding:10px;margin-top:10px}
+.list div{padding:2px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <h1>🧹 Limpar Fotos do MediObra</h1>
+  <p>Libera espaço apagando fotos — obras e medições continuam intactas</p>
+</div>
+<div class="wrap">
+  <div class="card">
+    <h2>Fotos guardadas hoje</h2>
+    <div class="stat" id="count">—</div>
+    <div class="stat-label" id="countLabel">carregando…</div>
+    <div class="list" id="list" style="display:none"></div>
+  </div>
+
+  <div class="card">
+    <button class="btn btn-danger" id="btnClear" disabled onclick="clearPhotos()">🗑️ Apagar todas as fotos</button>
+    <div class="hint">
+      Isso NÃO apaga suas obras, ruas, disciplinas, serviços ou o % de avanço de cada medição — só as fotos ficam vazias depois. Baixe as fotos importantes antes, se ainda não baixou.
+    </div>
+  </div>
+
+  <div class="status" id="status"></div>
+</div>
+
+<script>
+const DB_NAME = 'mediobra_photos_db';
+const STORE = 'photos';
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function countPhotos() {
+  try {
+    const db = await openDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const store = tx.objectStore(STORE);
+      const keys = [];
+      let totalFotos = 0;
+      const req = store.openCursor();
+      req.onsuccess = e => {
+        const cur = e.target.result;
+        if (cur) {
+          keys.push({ key: cur.key, n: (cur.value||[]).length });
+          totalFotos += (cur.value||[]).length;
+          cur.continue();
+        } else {
+          resolve({ keys, totalFotos });
+        }
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch(e) {
+    throw e;
+  }
+}
+
+async function clearAllPhotos() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).clear();
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function init() {
+  try {
+    const { keys, totalFotos } = await countPhotos();
+    document.getElementById('count').textContent = totalFotos;
+    document.getElementById('countLabel').textContent =
+      totalFotos === 0 ? 'nenhuma foto guardada' : `foto(s) em ${keys.length} local(is) diferentes`;
+    document.getElementById('btnClear').disabled = totalFotos === 0;
+
+    if (keys.length) {
+      const list = document.getElementById('list');
+      list.style.display = 'block';
+      list.innerHTML = keys
+        .sort((a,b)=>b.n-a.n)
+        .slice(0, 50)
+        .map(k => `<div>${k.key.split('__').slice(2).join(' / ')} — ${k.n} foto(s)</div>`)
+        .join('');
+    }
+  } catch(e) {
+    document.getElementById('countLabel').textContent = 'Erro ao ler dados: ' + e.message;
+  }
+}
+
+async function clearPhotos() {
+  const btn = document.getElementById('btnClear');
+  const status = document.getElementById('status');
+  if (!confirm('Tem certeza? Isso apaga TODAS as fotos guardadas no app (não dá pra desfazer). As obras e o progresso das medições continuam normalmente.')) return;
+
+  btn.disabled = true;
+  status.textContent = 'Apagando...';
+  try {
+    await clearAllPhotos();
+    status.innerHTML = '<span class="ok">✓ Fotos apagadas com sucesso!</span><br>Pode voltar para o MediObra normalmente.';
+    document.getElementById('count').textContent = '0';
+    document.getElementById('countLabel').textContent = 'nenhuma foto guardada';
+    document.getElementById('list').style.display = 'none';
+  } catch(e) {
+    status.textContent = 'Erro ao apagar: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
+init();
+</script>
+</body>
+</html>
